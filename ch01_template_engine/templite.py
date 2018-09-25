@@ -84,7 +84,7 @@ class Templite(object):
             if len(buffered) == 1:
                 code.add_line('append_result(%s)' % buffered[0])
             elif len(buffered) > 1:
-                code.add_line('extend_result(%s)' % buffered)
+                code.add_line('extend_result([%s])' % ', '.join(buffered))
             del buffered[:]
 
         ops_stack = []
