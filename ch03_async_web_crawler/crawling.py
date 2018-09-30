@@ -14,6 +14,7 @@ import asyncio
 import urllib.parse
 import re
 import time
+import cgi
 
 try:
     from asyncio import JoinableQueue as Queue
@@ -97,11 +98,81 @@ class Crawler:
 
     @asyncio.coroutine
     def parse_links(self, response):
-        pass
+        links = set()
+        content_type = None
+        encoding = None
+        body = yield from response.read()
+
+        if response.status == 200:
+            content_type = response.headers.get('content-type')
+            pdict = {}
+
+            if content_type:
+                content_type, pdict = cgi.parse_header(content_type)
+
+            encoding = pdict.get('charset', 'utf-8')
+            if content_type in ('text/html', 'application/xml'):
+                text = yield from response.text()
+
+                urls = set(re.findall(r"""(?i)href=["']?([^\s"'<>]+)""", text))
+                if urls:
+                    logger.info('got %r distinct urls from %r', len(urls), response.url)
+                for url in urls:
+                    normalized = urllib.parse.urljoin(response.url, url)
+                    defragmented, frag = urllib.parse.urldefrag(normalized)
+                    if self.url_allowed(defragmented):
+                        links.add(defragmented)
+
+        stats = FetchStatistic(url=response.url, next_url=None, status=response.status, exception=None, size=len(body),
+                               content_type=content_type, encoding=encoding, num_urls=len(links),
+                               num_new_urls=len(links - self.seen_urls))
+        return stats, links
 
     @asyncio.coroutine
     def fetch(self, url, max_redirect):
-        pass
+        tries = 0
+        exception = None
+        while tries < self.max_tries:
+            try:
+                response = yield from self.session.get(url, allow_redirects=False)
+                if tries > 1:
+                    logger.info('try %r for % success', tries, url)
+                break
+            except aiohttp.ClientError as client_error:
+                logger.info('try %r for %r raised %r', tries, url, client_error)
+                exception = client_error
+
+            tries += 1
+
+        else:
+            logger.error('%r failed after %r tries', url, self.max_tries)
+
+            self.record_statistic(FetchStatistic(url=url, next_url=None, status=None, exception=exception, size=0,
+                                                 content_type=None, encoding=None, num_urls=0, num_new_urls=0))
+            return
+
+        try:
+            if is_redirect(response):
+                location = response.headers['location']
+                next_url = urllib.parse.urljoin(url, location)
+                self.record_statistic(
+                    FetchStatistic(url=url, next_url=next_url, status=response.status, exception=None, size=0,
+                                   content_type=None, encoding=None, num_urls=0, num_new_urls=0))
+                if next_url in self.seen_urls:
+                    return
+                if max_redirect > 0:
+                    logger.info('redirect to %r from %r', next_url, url)
+                    self.add_url(next_url, max_redirect - 1)
+                else:
+                    logger.error('redirect limit reached for &r from %r', next_url, url)
+            else:
+                stat, links = yield from self.parse_links(response)
+                self.record_statistic(stat)
+                for link in links.difference(self.seen_urls):
+                    self.q.put_nowait((link, self.max_redirect))
+                self.seen_urls.update(links)
+        finally:
+            pass
 
     @asyncio.coroutine
     def work(self):
